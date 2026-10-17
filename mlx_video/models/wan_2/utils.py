@@ -1,9 +1,42 @@
 """Wan model loading utilities."""
 
+from contextlib import contextmanager
 from pathlib import Path
+import resource
+import sys
+import time
 
 import mlx.core as mx
 import mlx.nn as nn
+
+
+@contextmanager
+def _profile_stage(label, enabled=False):
+    """Diagnostic boundaries synchronize MLX; peak values cover the process lifetime."""
+    if not enabled:
+        yield
+        return
+
+    def memory():
+        gib = 1024**3
+        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        rss_bytes = rss if sys.platform == "darwin" else rss * 1024
+        return (
+            f"MLX active={mx.get_active_memory() / gib:.2f} GiB, "
+            f"cache={mx.get_cache_memory() / gib:.2f} GiB, "
+            f"peak={mx.get_peak_memory() / gib:.2f} GiB, "
+            f"process peak RSS={rss_bytes / gib:.2f} GiB"
+        )
+
+    print(f"[profile] {label}: start | {memory()}", flush=True)
+    mx.synchronize()
+    start = time.perf_counter()
+    yield
+    mx.synchronize()
+    print(
+        f"[profile] {label}: {time.perf_counter() - start:.3f}s | {memory()}",
+        flush=True,
+    )
 
 
 def load_wan_model(
@@ -62,29 +95,38 @@ def load_wan_model(
     return model
 
 
-def load_t5_encoder(model_path: Path, config):
+def load_t5_encoder(model_path: Path, config, *, profile=False):
     """Load T5 text encoder.
 
-    Weights are upcast to float32 for maximum precision — the T5 encoder
-    only runs once per generation, so performance impact is negligible.
-    This matches the official which computes softmax in float32 explicitly.
+    Preserves checkpoint precision to avoid expanding BF16 weights to FP32.
+    Attention scores and softmax are still computed in float32.
     """
     from mlx_video.models.wan_2.text_encoder import T5Encoder
 
-    encoder = T5Encoder(
-        vocab_size=config.t5_vocab_size,
-        dim=config.t5_dim,
-        dim_attn=config.t5_dim_attn,
-        dim_ffn=config.t5_dim_ffn,
-        num_heads=config.t5_num_heads,
-        num_layers=config.t5_num_layers,
-        num_buckets=config.t5_num_buckets,
-        shared_pos=False,
-    )
-    weights = mx.load(str(model_path))
-    weights = {k: v.astype(mx.float32) for k, v in weights.items()}
-    encoder.load_weights(list(weights.items()))
-    mx.eval(encoder.parameters())
+    with _profile_stage("T5 construction", profile):
+        encoder = T5Encoder(
+            vocab_size=config.t5_vocab_size,
+            dim=config.t5_dim,
+            dim_attn=config.t5_dim_attn,
+            dim_ffn=config.t5_dim_ffn,
+            num_heads=config.t5_num_heads,
+            num_layers=config.t5_num_layers,
+            num_buckets=config.t5_num_buckets,
+            shared_pos=False,
+        )
+    with _profile_stage("T5 checkpoint load call (may defer I/O)", profile):
+        weights = mx.load(str(model_path))
+    if profile:
+        sizes = {}
+        for weight in weights.values():
+            dtype = str(weight.dtype)
+            sizes[dtype] = sizes.get(dtype, 0) + weight.nbytes
+        print(f"[profile] T5 checkpoint bytes by dtype: {sizes}", flush=True)
+    with _profile_stage("T5 weight assignment", profile):
+        # weights = {k: v.astype(mx.float32) for k, v in weights.items()}
+        encoder.load_weights(list(weights.items()))
+    with _profile_stage("T5 weight evaluation (includes deferred load)", profile):
+        mx.eval(encoder.parameters())
     return encoder
 
 
@@ -161,6 +203,9 @@ def encode_text(
     tokenizer,
     prompt: str,
     text_len: int = 512,
+    *,
+    profile=False,
+    profile_label="prompt",
 ) -> mx.array:
     """Encode text prompt using T5 encoder.
 
@@ -173,19 +218,34 @@ def encode_text(
     Returns:
         Text embeddings [L, dim]
     """
-    prompt = _clean_text(prompt)
-    tokens = tokenizer(
-        prompt,
-        max_length=text_len,
-        padding="max_length",
-        truncation=True,
-        return_tensors="np",
-    )
-    ids = mx.array(tokens["input_ids"])
-    mask = mx.array(tokens["attention_mask"])
+    with _profile_stage(f"T5 {profile_label}: cleaning/tokenization", profile):
+        prompt = _clean_text(prompt)
+        tokens = tokenizer(
+            prompt,
+            max_length=text_len,
+            padding="max_length",
+            truncation=True,
+            return_tensors="np",
+        )
+    if profile:
+        print(
+            f"[profile] T5 {profile_label}: "
+            f"tokens={int(tokens['attention_mask'].sum())}, "
+            f"padded_length={tokens['input_ids'].shape[-1]}",
+            flush=True,
+        )
+    with _profile_stage(f"T5 {profile_label}: input arrays", profile):
+        ids = mx.array(tokens["input_ids"])
+        mask = mx.array(tokens["attention_mask"])
 
-    embeddings = encoder(ids, mask=mask)
+    with _profile_stage(f"T5 {profile_label}: forward graph construction", profile):
+        embeddings = encoder(ids, mask=mask)
 
-    # Return only non-padding tokens
-    seq_len = int(mask.sum().item())
-    return embeddings[0, :seq_len]
+    # Return only non-padding tokens; item() is also a synchronization boundary.
+    with _profile_stage(f"T5 {profile_label}: length extraction and slicing", profile):
+        seq_len = int(mask.sum().item())
+        embeddings = embeddings[0, :seq_len]
+    if profile:
+        with _profile_stage(f"T5 {profile_label}: output evaluation", profile):
+            mx.eval(embeddings)
+    return embeddings

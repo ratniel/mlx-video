@@ -13,6 +13,7 @@ from tqdm import tqdm
 
 from mlx_video.models.wan_2.i2v_utils import build_i2v_mask, preprocess_image
 from mlx_video.models.wan_2.utils import (
+    _profile_stage,
     encode_text,
     load_t5_encoder,
     load_vae_decoder,
@@ -85,10 +86,12 @@ def generate_video(
     no_compile: bool = False,
     trim_first_frames: int = 0,
     debug_latents: bool = False,
+    profile_t5: bool = False,
 ):
     """Generate video using Wan pipeline (supports T2V and I2V).
 
     Args:
+        profile_t5: Log synchronized T5 stage timings and memory
         model_dir: Path to converted MLX model directory
         prompt: Text prompt
         negative_prompt: Negative prompt (None = use config default, "" = no negative prompt)
@@ -328,30 +331,49 @@ def generate_video(
     t1 = time.time()
     print(f"\n{Colors.BLUE}Loading T5 encoder...{Colors.RESET}")
     t5_path = model_dir / "t5_encoder.safetensors"
-    t5_encoder = load_t5_encoder(t5_path, config)
+    t5_encoder = load_t5_encoder(t5_path, config, profile=profile_t5)
+    print(f"\n{Colors.BLUE}T5 encoder loaded: {time.time() - t1:.1f}s{Colors.RESET}")
 
-    # Load tokenizer
-    from transformers import AutoTokenizer
+    # Include the transformers import in tokenizer startup time.
+    with _profile_stage("T5 tokenizer import/load", profile_t5):
+        from transformers import AutoTokenizer
 
-    tokenizer = AutoTokenizer.from_pretrained("google/umt5-xxl")
+        tokenizer = AutoTokenizer.from_pretrained("google/umt5-xxl")
 
     # Encode prompts
+    t2 = time.time()
     print(f"{Colors.BLUE}Encoding text...{Colors.RESET}")
-    context = encode_text(t5_encoder, tokenizer, prompt, config.text_len)
+    context = encode_text(
+        t5_encoder,
+        tokenizer,
+        prompt,
+        config.text_len,
+        profile=profile_t5,
+        profile_label="positive",
+    )
     if cfg_disabled:
         context_null = None
         mx.eval(context)
     else:
         context_null = encode_text(
-            t5_encoder, tokenizer, neg_prompt_resolved, config.text_len
+            t5_encoder,
+            tokenizer,
+            neg_prompt_resolved,
+            config.text_len,
+            profile=profile_t5,
+            profile_label="negative",
         )
         mx.eval(context, context_null)
+    print(f"{Colors.DIM}  T5 prompt encoding: {time.time() - t2:.1f}s{Colors.RESET}")
 
     # Free T5 from memory
-    del t5_encoder
-    gc.collect()
-    mx.clear_cache()
-    print(f"{Colors.DIM}  T5 encoding: {time.time() - t1:.1f}s{Colors.RESET}")
+    with _profile_stage("T5 encoder deletion", profile_t5):
+        del t5_encoder
+    with _profile_stage("T5 garbage collection", profile_t5):
+        gc.collect()
+    with _profile_stage("T5 cache clearing", profile_t5):
+        mx.clear_cache()
+    print(f"{Colors.DIM}  T5 total (load, encode, cleanup): {time.time() - t1:.1f}s{Colors.RESET}")
 
     # I2V: encode image to latent space
     z_img = None
@@ -698,30 +720,32 @@ def generate_video(
             )
         print()
 
-    # Free transformer models and text embeddings
-    if is_dual:
-        del low_noise_model, high_noise_model, cross_kv_low, cross_kv_high
-        if cfg_disabled:
-            del context_cond_low, context_cond_high
+    with _profile_stage("DiT cleanup before VAE", profile_t5):
+        # Free transformer models and text embeddings
+        if is_dual:
+            del low_noise_model, high_noise_model, cross_kv_low, cross_kv_high
+            if cfg_disabled:
+                del context_cond_low, context_cond_high
+            else:
+                del context_cfg_low, context_cfg_high
         else:
-            del context_cfg_low, context_cfg_high
-    else:
-        del single_model, cross_kv
-        if cfg_disabled:
-            del context_cond
-        else:
-            del context_cfg
-    del model, kv, context
-    if context_null is not None:
-        del context_null
-    gc.collect()
-    mx.clear_cache()
+            del single_model, cross_kv
+            if cfg_disabled:
+                del context_cond
+            else:
+                del context_cfg
+        del model, kv, context
+        if context_null is not None:
+            del context_null
+        gc.collect()
+        mx.clear_cache()
 
     # Load VAE and decode
     print(f"\n{Colors.BLUE}Decoding with VAE...{Colors.RESET}")
     t4 = time.time()
     vae_path = model_dir / "vae.safetensors"
-    vae = load_vae_decoder(vae_path, config)
+    with _profile_stage("VAE weight loading", profile_t5):
+        vae = load_vae_decoder(vae_path, config)
 
     is_wan22_vae = config.vae_z_dim == 48
 
@@ -930,6 +954,11 @@ def main():
         action="store_true",
         help="Print per-temporal-position latent statistics after denoising (diagnostic)",
     )
+    parser.add_argument(
+        "--profile-t5",
+        action="store_true",
+        help="Log synchronized T5, DiT cleanup, and VAE loading timings/memory (adds overhead)",
+    )
     args = parser.parse_args()
 
     # Parse guide scale
@@ -970,6 +999,7 @@ def main():
         no_compile=args.no_compile,
         trim_first_frames=args.trim_first_frames,
         debug_latents=args.debug_latents,
+        profile_t5=args.profile_t5,
     )
 
 
